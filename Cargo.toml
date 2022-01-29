@@ -1,0 +1,22 @@
+[package]
+name = "forgers"
+version = "0.1.0"
+authors = ["wolflo <wolflo@protonmail.com>"]
+license = "MIT OR Apache-2.0"
+edition = "2021"
+readme = "README.md"
+repository = "https://github.com/wolflo/forge-rs"
+
+[dependencies]
+ethers-core = { git = "https://github.com/gakonst/ethers-rs" }
+ethers-providers = { git = "https://github.com/gakonst/ethers-rs" }
+evm-adapters = { git = "https://github.com/gakonst/foundry", features = ["sputnik", "sputnik-helpers"] }
+sputnik = { git = "https://github.com/rust-blockchain/evm", package = "evm" }
+eyre = "0.6.5"
+tokio = "1.5"
+async-trait = { version = "0.1.50", default-features = false }
+thiserror = { version = "1.0.30", default-features = false }
+
+[patch."https://github.com/gakonst/ethers-rs"]
+ethers-providers = { path = "../ext/ethers-rs/ethers-providers" }
+ethers-core = { path = "../ext/ethers-rs/ethers-core" }
