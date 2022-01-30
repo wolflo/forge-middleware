@@ -4,7 +4,8 @@ use ethers_core::types::{
     NameOrAddress, TransactionReceipt, TxHash, H256, U256, U64,
 };
 use ethers_providers::{
-    maybe, FromErr, JsonRpcClient, Middleware, PendingTransaction, PendingTxState, ProviderError,
+    maybe, FromErr, JsonRpcClient, Middleware, PendingTransaction, PendingTxState, Provider,
+    ProviderError,
 };
 use evm_adapters::{
     sputnik::{Executor, SputnikExecutor},
@@ -20,7 +21,7 @@ use std::{
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-const DEFAULT_SENDER: &'static str = "0xD3D13a578a53685B4ac36A1Bab31912D2B2A2F36";
+const DEFAULT_SENDER: &str = "0xD3D13a578a53685B4ac36A1Bab31912D2B2A2F36";
 
 pub trait VmShow {
     fn gas_price(&self) -> U256;
@@ -67,10 +68,37 @@ pub enum TxOutput {
     CallRes(Bytes),
     CreateRes(Address),
 }
+impl TxOutput {
+    pub fn maybe_addr(&self) -> Option<Address> {
+        match self {
+            Self::CreateRes(addr) => Some(*addr),
+            _ => None,
+        }
+    }
+    pub fn maybe_bytes(self) -> Option<Bytes> {
+        match self {
+            Self::CallRes(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+}
 
+impl<E, S> Forge<Provider<NoClient>, E, S> {
+    pub fn new(vm: Arc<RwLock<E>>) -> Self {
+        Self {
+            vm,
+            inner: Provider::new(NoClient::new()),
+            _ghost: PhantomData,
+        }
+    }
+}
 impl<M, E, S> Forge<M, E, S> {
-    pub fn new(inner: M, vm: Arc<RwLock<E>>) -> Self {
-        Self { vm, inner, _ghost: PhantomData }
+    pub fn new_with_provider(vm: Arc<RwLock<E>>, inner: M) -> Self {
+        Self {
+            vm,
+            inner,
+            _ghost: PhantomData,
+        }
     }
     async fn vm(&self) -> impl Deref<Target = E> + '_ {
         self.vm.read().await
@@ -117,11 +145,21 @@ where
             let to = fut.await?;
             let (bytes, exit, gas, logs) =
                 self.vm_mut().await.call_raw(*from, to, data, *val, false)?;
-            Ok(TxRes { output: TxOutput::CallRes(bytes), exit, gas, logs })
+            Ok(TxRes {
+                output: TxOutput::CallRes(bytes),
+                exit,
+                gas,
+                logs,
+            })
         } else {
             // contract deployment
             let (addr, exit, gas, logs) = self.vm_mut().await.deploy(*from, data.clone(), *val)?;
-            Ok(TxRes { output: TxOutput::CreateRes(addr), exit, gas, logs })
+            Ok(TxRes {
+                output: TxOutput::CreateRes(addr),
+                exit,
+                gas,
+                logs,
+            })
         }
     }
 
@@ -270,7 +308,10 @@ where
             let addr = self.to_addr(from).await?;
             Ok(self.vm().await.balance(addr))
         } else {
-            self.inner.get_balance(from, block).await.map_err(FromErr::from)
+            self.inner()
+                .get_balance(from, block)
+                .await
+                .map_err(FromErr::from)
         }
     }
 
@@ -280,29 +321,36 @@ where
         block: Option<BlockId>,
     ) -> Result<PendingTransaction<'_, Self::Provider>, Self::Error> {
         let mut tx = tx.into();
+
         self.fill_transaction(&mut tx, block).await?;
 
         // run the tx
         let res = self.apply_tx(&tx).await?;
 
-        // create receipt and populate with result of applying the tx
-        let mut receipt = TransactionReceipt::default();
-        receipt.gas_used = Some(res.gas.into());
-        receipt.status = Some((if E::is_success(&res.exit) { 1usize } else { 0 }).into());
-        if let TxOutput::CreateRes(addr) = res.output {
-            receipt.contract_address = Some(addr);
-        }
+        // receipt fields
+        let gas_used = Some(res.gas.into());
+        let status = Some((if E::is_success(&res.exit) { 1usize } else { 0 }).into());
+        let contract_address = res.output.maybe_addr();
 
         // Fake the tx hash for the receipt. Should be able to get a "real"
         // hash modulo signature, which we may not have
-        let hash = tx.sighash(self.get_chainid().await?.as_u64());
-        receipt.transaction_hash = hash;
+        let transaction_hash = tx.sighash(self.get_chainid().await?.as_u64());
 
-        let mut pending = PendingTransaction::new(hash, self.provider());
+        let receipt = TransactionReceipt {
+            gas_used,
+            status,
+            contract_address,
+            transaction_hash,
+            confirmations: 1,
+            ..Default::default()
+        };
+
         // Set the future to resolve immediately to the populated receipt when polled.
-        // TODO: handle confirmations > 1. Likely need a dummy Provider that impls
-        // get_block_number() using internal evm
+        // This should not attempt to use the provider because the new PendingTransaction
+        // has confirmations = 1
+        let mut pending = PendingTransaction::new(transaction_hash, self.provider());
         pending.set_state(PendingTxState::CheckingReceipt(Some(receipt)));
+
         Ok(pending)
     }
 
@@ -390,50 +438,65 @@ where
     }
 }
 
+// Dummy provider / Middleware indicating an empty provider
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoClient;
+impl NoClient {
+    pub fn new() -> Self {
+        Self
+    }
+}
+#[async_trait]
+impl JsonRpcClient for NoClient {
+    type Error = ProviderError;
+    async fn request<T, R>(&self, _method: &str, _params: T) -> Result<R, Self::Error>
+    where
+        T: std::fmt::Debug + serde::Serialize + Send + Sync,
+        R: serde::de::DeserializeOwned,
+    {
+        unreachable!("Cannot send requests")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use ethers_core::types::{Address, TransactionRequest};
-    use ethers_providers::Provider;
     use evm_adapters::sputnik::{
         helpers::{new_backend, CFG, GAS_LIMIT, VICINITY},
         Executor, PRECOMPILES_MAP,
     };
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct NullProvider;
-    impl NullProvider {
-        pub fn new() -> Self {
-            Self
-        }
-    }
-    #[async_trait]
-    impl JsonRpcClient for NullProvider {
-        type Error = ProviderError;
-
-        async fn request<T, R>(&self, _method: &str, _params: T) -> Result<R, Self::Error>
-        where
-            T: std::fmt::Debug + serde::Serialize + Send + Sync,
-            R: serde::de::DeserializeOwned,
-        {
-            unreachable!("Cannot send requests")
-        }
-    }
-
     #[tokio::test]
     async fn test_forge() {
-        let from: Address = "0xEA674fdDe714fd979de3EdF0F56AA9716B898ec8".parse().unwrap();
-        let to: Address = "0xD3D13a578a53685B4ac36A1Bab31912D2B2A2F36".parse().unwrap();
-
-        let provider = Provider::new(NullProvider);
+        let from: Address = "0xEA674fdDe714fd979de3EdF0F56AA9716B898ec8"
+            .parse()
+            .unwrap();
+        let to: Address = "0xD3D13a578a53685B4ac36A1Bab31912D2B2A2F36"
+            .parse()
+            .unwrap();
 
         let backend = new_backend(&*VICINITY, Default::default());
-        let vm = Executor::new(GAS_LIMIT, &*CFG, &backend, &*PRECOMPILES_MAP);
-        let forge = Forge::new(provider, Arc::new(RwLock::new(vm)));
+        let vm = Arc::new(RwLock::new(Executor::new(
+            GAS_LIMIT,
+            &*CFG,
+            &backend,
+            &*PRECOMPILES_MAP,
+        )));
+        let forge = Forge::new(vm);
 
-        let tx = TransactionRequest::new().to(to).from(from).value(1).gas(2300);
-        let receipt = forge.send_transaction(tx, None).await.unwrap().await.unwrap();
+        let tx = TransactionRequest::new()
+            .to(to)
+            .from(from)
+            .value(1)
+            .gas(2300);
+        let receipt = forge
+            .send_transaction(tx, None)
+            .await
+            .unwrap()
+            .await
+            .unwrap();
         dbg!(receipt);
     }
 }
