@@ -11,7 +11,7 @@ use std::fmt::Debug;
 use thiserror::Error;
 
 use crate::{
-    core::{Forge, TxOutput},
+    core::{Forge, Inner, TxOutput},
     evm::VmShow,
 };
 
@@ -23,8 +23,6 @@ pub enum ForgeError<M: Middleware> {
     ProviderError(ProviderError),
     #[error("{0}")]
     EvmError(EvmError),
-    #[error("{0}")]
-    Eyre(eyre::Error),
 }
 impl<M: Middleware> FromErr<M::Error> for ForgeError<M> {
     fn from(src: M::Error) -> ForgeError<M> {
@@ -69,7 +67,7 @@ where
     type Inner = M;
 
     fn inner(&self) -> &Self::Inner {
-        &self.inner
+        self.inner.get()
     }
 
     async fn estimate_gas(&self, _tx: &TypedTransaction) -> Result<U256, Self::Error> {
@@ -143,7 +141,7 @@ where
 
         // Fake the tx hash for the receipt. Should be able to get a "real"
         // hash modulo signature, which we may not have
-        let transaction_hash = tx.sighash(self.get_chainid().await?.as_u64());
+        let transaction_hash = tx.sighash();
 
         let receipt = TransactionReceipt {
             gas_used,

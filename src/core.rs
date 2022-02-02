@@ -17,10 +17,41 @@ use crate::evm::VmShow;
 
 const DEFAULT_SENDER: &str = "0xD3D13a578a53685B4ac36A1Bab31912D2B2A2F36";
 
+#[derive(Debug, Clone)]
+pub enum Inner<T> {
+    Use(T), // Indicates a valid provider to fallback to
+    Not(T), // Indicates a dummy provider that should not be used
+}
+impl Inner<Provider<NoClient>> {
+    pub fn not() -> Self {
+        Self::Not(Provider::new(NoClient::new()))
+    }
+}
+impl<T> Inner<T> {
+    pub fn is_not(&self) -> bool {
+        match self {
+            Self::Not(_) => true,
+            _ => false,
+        }
+    }
+    pub fn is_use(&self) -> bool {
+        match self {
+            Self::Use(_) => true,
+            _ => false,
+        }
+    }
+    pub fn get(&self) -> &T {
+        match self {
+            Self::Use(x) => x,
+            Self::Not(x) => x,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Forge<M, E, S> {
     pub vm: Arc<RwLock<E>>,
-    pub inner: M,
+    pub inner: Inner<M>,
     _ghost: PhantomData<S>,
 }
 
@@ -28,7 +59,7 @@ impl<E, S> Forge<Provider<NoClient>, E, S> {
     pub fn new(vm: Arc<RwLock<E>>) -> Self {
         Self {
             vm,
-            inner: Provider::new(NoClient::new()),
+            inner: Inner::not(),
             _ghost: PhantomData,
         }
     }
@@ -37,7 +68,7 @@ impl<M, E, S> Forge<M, E, S> {
     pub fn new_with_provider(vm: Arc<RwLock<E>>, inner: M) -> Self {
         Self {
             vm,
-            inner,
+            inner: Inner::Use(inner),
             _ghost: PhantomData,
         }
     }
@@ -127,7 +158,6 @@ where
         match id {
             BlockId::Hash(hash) => {
                 let vm = self.vm().await;
-                // let last_num = vm.block_number() - U256::one();
                 let last_hash = vm.block_hash(vm.block_number() - U256::one());
                 // If we get the default hash back, the vm doesn't have the block data
                 Ok(last_hash != Default::default() && hash == last_hash)
@@ -137,15 +167,16 @@ where
                 BlockNumber::Number(num) => {
                     Ok(num == (self.get_block_number().await? - U64::one()))
                 }
-                // BlockNumber::Pending => Ok(false), //TODO
+                BlockNumber::Pending => Ok(true), //TODO
                 _ => Ok(false),
             },
         }
     }
 
     // Sputnik can provide hashes for any block it produced, but not the rest of the block data
-    pub async fn get_block_hash(&self, _num: U256) -> H256 {
-        todo!()
+    pub async fn get_block_hash(&self, num: U256) -> H256 {
+        // TODO: try to pull historical data if we get back default and have a provider
+        self.vm().await.block_hash(num)
     }
 
     pub async fn to_addr<T: Into<NameOrAddress>>(
